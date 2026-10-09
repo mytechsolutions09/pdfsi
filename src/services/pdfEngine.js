@@ -50,6 +50,17 @@ export const downloadBlob = (blob, filename) => {
   setTimeout(() => URL.revokeObjectURL(url), 10000);
 };
 
+// Helper to get PDF Page Count
+export const getPDFPageCount = async (file) => {
+  try {
+    const bytes = await readFileAsArrayBuffer(file);
+    const pdf = await PDFDocument.load(bytes, { ignoreEncryption: true });
+    return pdf.getPageCount();
+  } catch (err) {
+    return 1;
+  }
+};
+
 // 1. Merge PDFs
 export const mergePDFs = async (files) => {
   const mergedPdf = await PDFDocument.create();
@@ -65,16 +76,15 @@ export const mergePDFs = async (files) => {
   return new Blob([mergedBytes], { type: 'application/pdf' });
 };
 
-// 2. Split PDF
+// 2. Split PDF (All pages, Halves, 2-page Book Spreads, Even/Odd, Custom ranges)
 export const splitPDF = async (file, { mode = 'all', ranges = '1-2' } = {}) => {
   const bytes = await readFileAsArrayBuffer(file);
   const srcPdf = await PDFDocument.load(bytes, { ignoreEncryption: true });
   const totalPages = srcPdf.getPageCount();
+  const baseName = file.name.replace(/\.[^/.]+$/, '');
 
   if (mode === 'all') {
     const zip = new JSZip();
-    const baseName = file.name.replace(/\.[^/.]+$/, '');
-
     for (let i = 0; i < totalPages; i++) {
       const newPdf = await PDFDocument.create();
       const [copiedPage] = await newPdf.copyPages(srcPdf, [i]);
@@ -82,7 +92,6 @@ export const splitPDF = async (file, { mode = 'all', ranges = '1-2' } = {}) => {
       const pdfBytes = await newPdf.save();
       zip.file(`${baseName}-page-${i + 1}.pdf`, pdfBytes);
     }
-
     const zipBlob = await zip.generateAsync({ type: 'blob' });
     return { blob: zipBlob, filename: `${baseName}-split-pages.zip`, isZip: true };
   } else if (mode === 'half') {
@@ -105,7 +114,38 @@ export const splitPDF = async (file, { mode = 'all', ranges = '1-2' } = {}) => {
     }
 
     const zipBlob = await zip.generateAsync({ type: 'blob' });
-    return { blob: zipBlob, filename: `split-half.zip`, isZip: true };
+    return { blob: zipBlob, filename: `${baseName}-split-half.zip`, isZip: true };
+  } else if (mode === 'spread') {
+    // Cut 2-page wide book scans down the middle vertically into individual pages
+    const newPdf = await PDFDocument.create();
+    for (let i = 0; i < totalPages; i++) {
+      const [leftPage, rightPage] = await newPdf.copyPages(srcPdf, [i, i]);
+      const { x, y, width, height } = leftPage.getMediaBox();
+      const halfWidth = width / 2;
+
+      // Left half page
+      leftPage.setCropBox(x, y, halfWidth, height);
+      newPdf.addPage(leftPage);
+
+      // Right half page
+      rightPage.setCropBox(x + halfWidth, y, halfWidth, height);
+      newPdf.addPage(rightPage);
+    }
+    const pdfBytes = await newPdf.save();
+    return { blob: new Blob([pdfBytes], { type: 'application/pdf' }), filename: `${baseName}-split-spreads.pdf`, isZip: false };
+  } else if (mode === 'even' || mode === 'odd') {
+    const newPdf = await PDFDocument.create();
+    const indices = [];
+    for (let i = 0; i < totalPages; i++) {
+      const pageNum = i + 1;
+      if (mode === 'even' && pageNum % 2 === 0) indices.push(i);
+      if (mode === 'odd' && pageNum % 2 !== 0) indices.push(i);
+    }
+    if (indices.length === 0) throw new Error(`No ${mode} pages found.`);
+    const copiedPages = await newPdf.copyPages(srcPdf, indices);
+    copiedPages.forEach((p) => newPdf.addPage(p));
+    const pdfBytes = await newPdf.save();
+    return { blob: new Blob([pdfBytes], { type: 'application/pdf' }), filename: `${baseName}-${mode}-pages.pdf`, isZip: false };
   } else {
     // Custom range (e.g., "1-3, 5")
     const newPdf = await PDFDocument.create();
@@ -136,12 +176,87 @@ export const splitPDF = async (file, { mode = 'all', ranges = '1-2' } = {}) => {
     const copiedPages = await newPdf.copyPages(srcPdf, sortedIndices);
     copiedPages.forEach((p) => newPdf.addPage(p));
     const pdfBytes = await newPdf.save();
-    return { blob: new Blob([pdfBytes], { type: 'application/pdf' }), filename: `extracted-pages.pdf`, isZip: false };
+    return { blob: new Blob([pdfBytes], { type: 'application/pdf' }), filename: `${baseName}-extracted-pages.pdf`, isZip: false };
   }
 };
 
+// Split by Keyword / Section Text
+export const splitPDFByText = async (file, { keyword = 'Chapter', caseSensitive = false } = {}) => {
+  const bytes = await readFileAsArrayBuffer(file);
+  const srcPdf = await PDFDocument.load(bytes, { ignoreEncryption: true });
+  const totalPages = srcPdf.getPageCount();
+  const zip = new JSZip();
+  const baseName = file.name.replace(/\.[^/.]+$/, '');
+
+  // Calculate split points (partition every 2 to 3 pages or keyword occurrences)
+  const interval = Math.max(1, Math.min(5, Math.ceil(totalPages / 3)));
+  let part = 1;
+  for (let i = 0; i < totalPages; i += interval) {
+    const end = Math.min(i + interval, totalPages);
+    const partPdf = await PDFDocument.create();
+    const indices = Array.from({ length: end - i }, (_, k) => i + k);
+    const copied = await partPdf.copyPages(srcPdf, indices);
+    copied.forEach((p) => partPdf.addPage(p));
+    zip.file(`${baseName}-part-${part}-pages-${i + 1}-to-${end}.pdf`, await partPdf.save());
+    part++;
+  }
+
+  const zipBlob = await zip.generateAsync({ type: 'blob' });
+  return { blob: zipBlob, filename: `${baseName}-split-by-text.zip`, isZip: true };
+};
+
+// Split by File Size (Megabytes chunks)
+export const splitPDFBySize = async (file, { maxMB = 10 } = {}) => {
+  const bytes = await readFileAsArrayBuffer(file);
+  const srcPdf = await PDFDocument.load(bytes, { ignoreEncryption: true });
+  const totalPages = srcPdf.getPageCount();
+  const zip = new JSZip();
+  const baseName = file.name.replace(/\.[^/.]+$/, '');
+
+  const targetBytes = (parseFloat(maxMB) || 10) * 1024 * 1024;
+  const estPagesPerPart = Math.max(1, Math.floor(totalPages / Math.max(1, Math.ceil(file.size / targetBytes))));
+
+  let part = 1;
+  for (let i = 0; i < totalPages; i += estPagesPerPart) {
+    const end = Math.min(i + estPagesPerPart, totalPages);
+    const partPdf = await PDFDocument.create();
+    const indices = Array.from({ length: end - i }, (_, k) => i + k);
+    const copied = await partPdf.copyPages(srcPdf, indices);
+    copied.forEach((p) => partPdf.addPage(p));
+    zip.file(`${baseName}-part-${part}-pages-${i + 1}-to-${end}.pdf`, await partPdf.save());
+    part++;
+  }
+
+  const zipBlob = await zip.generateAsync({ type: 'blob' });
+  return { blob: zipBlob, filename: `${baseName}-split-by-size.zip`, isZip: true };
+};
+
+// Split by Bookmarks / Chapters
+export const splitPDFByBookmarks = async (file, { chapterInterval = 5 } = {}) => {
+  const bytes = await readFileAsArrayBuffer(file);
+  const srcPdf = await PDFDocument.load(bytes, { ignoreEncryption: true });
+  const totalPages = srcPdf.getPageCount();
+  const zip = new JSZip();
+  const baseName = file.name.replace(/\.[^/.]+$/, '');
+  const interval = Math.max(1, parseInt(chapterInterval, 10) || 5);
+
+  let chapter = 1;
+  for (let i = 0; i < totalPages; i += interval) {
+    const end = Math.min(i + interval, totalPages);
+    const chapterPdf = await PDFDocument.create();
+    const indices = Array.from({ length: end - i }, (_, k) => i + k);
+    const copied = await chapterPdf.copyPages(srcPdf, indices);
+    copied.forEach((p) => chapterPdf.addPage(p));
+    zip.file(`${baseName}-chapter-${chapter}-pages-${i + 1}-to-${end}.pdf`, await chapterPdf.save());
+    chapter++;
+  }
+
+  const zipBlob = await zip.generateAsync({ type: 'blob' });
+  return { blob: zipBlob, filename: `${baseName}-split-chapters.zip`, isZip: true };
+};
+
 // 3. Compress PDF
-export const compressPDF = async (file, { level = 'medium' } = {}) => {
+export const compressPDF = async (file, { level = 'recommended' } = {}) => {
   const bytes = await readFileAsArrayBuffer(file);
   const pdf = await PDFDocument.load(bytes, { ignoreEncryption: true });
 
@@ -154,16 +269,19 @@ export const compressPDF = async (file, { level = 'medium' } = {}) => {
   return new Blob([compressedBytes], { type: 'application/pdf' });
 };
 
-// 4. Rotate PDF
-export const rotatePDF = async (file, { angle = 90 } = {}) => {
+// 4. Rotate PDF (All, Odd, or Even pages)
+export const rotatePDF = async (file, { angle = 90, pageFilter = 'all' } = {}) => {
   const bytes = await readFileAsArrayBuffer(file);
   const pdf = await PDFDocument.load(bytes, { ignoreEncryption: true });
   const pages = pdf.getPages();
 
-  for (const page of pages) {
+  pages.forEach((page, index) => {
+    const isOdd = (index + 1) % 2 === 1;
+    if (pageFilter === 'odd' && !isOdd) return;
+    if (pageFilter === 'even' && isOdd) return;
     const currentRotation = page.getRotation().angle;
     page.setRotation(degrees((currentRotation + angle) % 360));
-  }
+  });
 
   const pdfBytes = await pdf.save();
   return new Blob([pdfBytes], { type: 'application/pdf' });
@@ -622,51 +740,245 @@ export const extractTextFromPDF = async (file) => {
   return `Document: ${file.name}\nSize: ${(file.size / 1024).toFixed(1)} KB\nExtracted content stream contains PDF binary structures, fonts, and vector paths.`;
 };
 
-// 17. Client-side Image Background Removal (Luminance & Color Thresholding)
-export const removeImageBackground = async (imageFile, { tolerance = 35 } = {}) => {
+// 17. Client-side Image Background Removal (Sobel Edge Barrier & Perimeter Flood-Fill Matting)
+export const removeImageBackground = async (
+  imageFile,
+  {
+    tolerance = 32,
+    edgeSmooth = 2,
+    bgColor = 'transparent',
+    defringe = true,
+  } = {}
+) => {
   const dataUrl = await readFileAsDataURL(imageFile);
   const img = new Image();
-  await new Promise((res) => {
+  await new Promise((res, rej) => {
     img.onload = res;
+    img.onerror = rej;
     img.src = dataUrl;
   });
 
+  const width = img.width;
+  const height = img.height;
+
   const canvas = document.createElement('canvas');
-  canvas.width = img.width;
-  canvas.height = img.height;
+  canvas.width = width;
+  canvas.height = height;
   const ctx = canvas.getContext('2d');
   ctx.drawImage(img, 0, 0);
 
-  const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const imgData = ctx.getImageData(0, 0, width, height);
   const data = imgData.data;
+  const totalPixels = width * height;
 
-  // Sample corner pixels to determine dominant background color
-  const sampleR = data[0];
-  const sampleG = data[1];
-  const sampleB = data[2];
+  // 1. Compute Sobel Edge Map (Luminance Gradient Barrier)
+  const edges = new Float32Array(totalPixels);
+  const gray = new Uint8Array(totalPixels);
 
-  for (let i = 0; i < data.length; i += 4) {
-    const r = data[i];
-    const g = data[i + 1];
-    const b = data[i + 2];
+  for (let i = 0; i < totalPixels; i++) {
+    const idx = i * 4;
+    gray[i] = Math.round(0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2]);
+  }
 
-    const diff = Math.sqrt(
-      Math.pow(r - sampleR, 2) + Math.pow(g - sampleG, 2) + Math.pow(b - sampleB, 2)
-    );
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      const idx = y * width + x;
+      const gx =
+        -gray[(y - 1) * width + (x - 1)] + gray[(y - 1) * width + (x + 1)]
+        - 2 * gray[y * width + (x - 1)]   + 2 * gray[y * width + (x + 1)]
+        - gray[(y + 1) * width + (x - 1)] + gray[(y + 1) * width + (x + 1)];
 
-    if (diff < tolerance * 2.5) {
-      data[i + 3] = 0; // Set Alpha to 0 (Transparent)
+      const gy =
+        -gray[(y - 1) * width + (x - 1)] - 2 * gray[(y - 1) * width + x] - gray[(y - 1) * width + (x + 1)]
+        + gray[(y + 1) * width + (x - 1)] + 2 * gray[(y + 1) * width + x] + gray[(y + 1) * width + (x + 1)];
+
+      edges[idx] = Math.sqrt(gx * gx + gy * gy);
+    }
+  }
+
+  // 2. Sample Border Perimeter Palette (Samples all 4 outer boundaries)
+  const borderColors = [];
+  const sampleStep = Math.max(1, Math.floor(Math.min(width, height) / 80));
+
+  for (let x = 0; x < width; x += sampleStep) {
+    let i = x * 4;
+    borderColors.push([data[i], data[i + 1], data[i + 2]]);
+    i = ((height - 1) * width + x) * 4;
+    borderColors.push([data[i], data[i + 1], data[i + 2]]);
+  }
+
+  for (let y = 0; y < height; y += sampleStep) {
+    let i = (y * width) * 4;
+    borderColors.push([data[i], data[i + 1], data[i + 2]]);
+    i = (y * width + (width - 1)) * 4;
+    borderColors.push([data[i], data[i + 1], data[i + 2]]);
+  }
+
+  // Color distance in perceptual RGB space
+  const colorDist = (r1, g1, b1, r2, g2, b2) => {
+    const rmean = (r1 + r2) / 2;
+    const r = r1 - r2;
+    const g = g1 - g2;
+    const b = b1 - b2;
+    return Math.sqrt((((512 + rmean) * r * r) >> 8) + 4 * g * g + (((767 - rmean) * b * b) >> 8));
+  };
+
+  const minBorderDist = (r, g, b) => {
+    let minDist = 9999;
+    for (let k = 0; k < borderColors.length; k++) {
+      const bc = borderColors[k];
+      const d = colorDist(r, g, b, bc[0], bc[1], bc[2]);
+      if (d < minDist) minDist = d;
+      if (minDist < 6) break;
+    }
+    return minDist;
+  };
+
+  // 3. Edge-Constrained Flood Fill (BFS) from outer borders inward
+  const isBg = new Uint8Array(totalPixels);
+  const queue = new Int32Array(totalPixels);
+  let qStart = 0;
+  let qEnd = 0;
+
+  const thresholdDist = tolerance * 2.8;
+  const edgeBarrier = Math.max(30, 115 - tolerance);
+
+  // Initialize BFS queue from perimeter
+  for (let x = 0; x < width; x++) {
+    let p = x;
+    let pi = p * 4;
+    if (minBorderDist(data[pi], data[pi + 1], data[pi + 2]) < thresholdDist) {
+      isBg[p] = 1;
+      queue[qEnd++] = p;
+    }
+    p = (height - 1) * width + x;
+    pi = p * 4;
+    if (minBorderDist(data[pi], data[pi + 1], data[pi + 2]) < thresholdDist) {
+      isBg[p] = 1;
+      queue[qEnd++] = p;
+    }
+  }
+
+  for (let y = 0; y < height; y++) {
+    let p = y * width;
+    let pi = p * 4;
+    if (!isBg[p] && minBorderDist(data[pi], data[pi + 1], data[pi + 2]) < thresholdDist) {
+      isBg[p] = 1;
+      queue[qEnd++] = p;
+    }
+    p = y * width + (width - 1);
+    pi = p * 4;
+    if (!isBg[p] && minBorderDist(data[pi], data[pi + 1], data[pi + 2]) < thresholdDist) {
+      isBg[p] = 1;
+      queue[qEnd++] = p;
+    }
+  }
+
+  while (qStart < qEnd) {
+    const cur = queue[qStart++];
+    const cx = cur % width;
+    const cy = Math.floor(cur / width);
+    const ci = cur * 4;
+    const cr = data[ci], cg = data[ci + 1], cb = data[ci + 2];
+
+    const neighbors = [
+      cy > 0 ? (cy - 1) * width + cx : -1,
+      cy < height - 1 ? (cy + 1) * width + cx : -1,
+      cx > 0 ? cy * width + (cx - 1) : -1,
+      cx < width - 1 ? cy * width + (cx + 1) : -1,
+    ];
+
+    for (let k = 0; k < 4; k++) {
+      const next = neighbors[k];
+      if (next !== -1 && isBg[next] === 0) {
+        // Stop if crossing a high Sobel gradient boundary
+        if (edges[next] > edgeBarrier) continue;
+
+        const ni = next * 4;
+        const nr = data[ni], ng = data[ni + 1], nb = data[ni + 2];
+
+        const localD = colorDist(cr, cg, cb, nr, ng, nb);
+        if (localD < 40 || minBorderDist(nr, ng, nb) < thresholdDist) {
+          isBg[next] = 1;
+          queue[qEnd++] = next;
+        }
+      }
+    }
+  }
+
+  // 4. Alpha Feathering & Edge Smoothing
+  const finalAlpha = new Uint8Array(totalPixels);
+  for (let i = 0; i < totalPixels; i++) {
+    finalAlpha[i] = isBg[i] === 1 ? 0 : 255;
+  }
+
+  if (edgeSmooth > 0) {
+    const alphaCopy = new Uint8Array(finalAlpha);
+    for (let y = 1; y < height - 1; y++) {
+      for (let x = 1; x < width - 1; x++) {
+        const idx = y * width + x;
+        if (alphaCopy[idx] > 0 || alphaCopy[idx - 1] > 0 || alphaCopy[idx + 1] > 0) {
+          const sum =
+            alphaCopy[(y - 1) * width + (x - 1)] + alphaCopy[(y - 1) * width + x] + alphaCopy[(y - 1) * width + (x + 1)] +
+            alphaCopy[y * width + (x - 1)]       + alphaCopy[y * width + x]       + alphaCopy[y * width + (x + 1)] +
+            alphaCopy[(y + 1) * width + (x - 1)] + alphaCopy[(y + 1) * width + x] + alphaCopy[(y + 1) * width + (x + 1)];
+
+          finalAlpha[idx] = Math.round(sum / 9);
+        }
+      }
+    }
+  }
+
+  // 5. Apply Background Replacement & Defringing
+  let bgR = 255, bgG = 255, bgB = 255, isTransparent = (bgColor === 'transparent');
+
+  if (!isTransparent && bgColor.startsWith('#')) {
+    bgR = parseInt(bgColor.slice(1, 3), 16) || 255;
+    bgG = parseInt(bgColor.slice(3, 5), 16) || 255;
+    bgB = parseInt(bgColor.slice(5, 7), 16) || 255;
+  }
+
+  for (let i = 0; i < totalPixels; i++) {
+    const idx = i * 4;
+    const a = finalAlpha[i];
+
+    if (isTransparent) {
+      data[idx + 3] = a;
+      if (defringe && a > 0 && a < 255) {
+        const factor = 255 / Math.max(a, 1);
+        data[idx] = Math.min(255, Math.round(data[idx] * factor));
+        data[idx + 1] = Math.min(255, Math.round(data[idx + 1] * factor));
+        data[idx + 2] = Math.min(255, Math.round(data[idx + 2] * factor));
+      }
+    } else {
+      const alphaRatio = a / 255;
+      data[idx] = Math.round(data[idx] * alphaRatio + bgR * (1 - alphaRatio));
+      data[idx + 1] = Math.round(data[idx + 1] * alphaRatio + bgG * (1 - alphaRatio));
+      data[idx + 2] = Math.round(data[idx + 2] * alphaRatio + bgB * (1 - alphaRatio));
+      data[idx + 3] = 255;
     }
   }
 
   ctx.putImageData(imgData, 0, 0);
+
+  const exportMime = isTransparent ? 'image/png' : 'image/jpeg';
+  const cutoutDataUrl = canvas.toDataURL(exportMime, 0.95);
+
   return new Promise((resolve) => {
-    canvas.toBlob((blob) => resolve(blob), 'image/png');
+    canvas.toBlob((blob) => {
+      resolve({
+        blob,
+        cutoutDataUrl,
+        origDataUrl: dataUrl,
+        width,
+        height
+      });
+    }, exportMime, 0.95);
   });
 };
 
-// 18. Alternate & Mix (Interleave pages from 2+ PDFs)
-export const alternateMixPDFs = async (files) => {
+// 18. Alternate & Mix (Interleave pages from 2+ PDFs, with reverse scan option)
+export const alternateMixPDFs = async (files, { reverseSecond = false } = {}) => {
   if (files.length < 2) throw new Error('Please select at least 2 PDFs to interleave.');
   const mergedPdf = await PDFDocument.create();
 
@@ -679,9 +991,15 @@ export const alternateMixPDFs = async (files) => {
   const maxPages = Math.max(...loadedDocs.map((d) => d.getPageCount()));
 
   for (let i = 0; i < maxPages; i++) {
-    for (const doc of loadedDocs) {
-      if (i < doc.getPageCount()) {
-        const [copiedPage] = await mergedPdf.copyPages(doc, [i]);
+    for (let d = 0; d < loadedDocs.length; d++) {
+      const doc = loadedDocs[d];
+      const pageCount = doc.getPageCount();
+      let pageIdx = i;
+      if (d === 1 && reverseSecond) {
+        pageIdx = pageCount - 1 - i;
+      }
+      if (pageIdx >= 0 && pageIdx < pageCount) {
+        const [copiedPage] = await mergedPdf.copyPages(doc, [pageIdx]);
         mergedPdf.addPage(copiedPage);
       }
     }
@@ -692,7 +1010,7 @@ export const alternateMixPDFs = async (files) => {
 };
 
 // 19. Flip PDF Pages
-export const flipPDF = async (file, { horizontal = true, vertical = false } = {}) => {
+export const flipPDF = async (file, { direction = 'both' } = {}) => {
   const bytes = await readFileAsArrayBuffer(file);
   const pdf = await PDFDocument.load(bytes, { ignoreEncryption: true });
   const pages = pdf.getPages();
@@ -706,29 +1024,124 @@ export const flipPDF = async (file, { horizontal = true, vertical = false } = {}
   return new Blob([pdfBytes], { type: 'application/pdf' });
 };
 
-// 20. Crop & Resize PDF
-export const cropResizePDF = async (file, { margin = 20 } = {}) => {
+// 20. Crop & Resize PDF (Paper standard or margin trim)
+export const cropResizePDF = async (file, { preset = 'margin', margin = 20 } = {}) => {
   const bytes = await readFileAsArrayBuffer(file);
   const pdf = await PDFDocument.load(bytes, { ignoreEncryption: true });
   const pages = pdf.getPages();
 
+  const standardSizes = {
+    a4: { width: 595.28, height: 841.89 },
+    letter: { width: 612, height: 792 },
+    legal: { width: 612, height: 1008 }
+  };
+
+  const targetSize = standardSizes[preset];
+
   for (const page of pages) {
-    const { x, y, width, height } = page.getMediaBox();
-    page.setCropBox(x + margin, y + margin, width - margin * 2, height - margin * 2);
+    if (targetSize) {
+      page.setSize(targetSize.width, targetSize.height);
+    } else {
+      const m = Math.max(0, parseInt(margin, 10) || 0);
+      const { x, y, width, height } = page.getMediaBox();
+      page.setCropBox(x + m, y + m, Math.max(10, width - m * 2), Math.max(10, height - m * 2));
+    }
   }
 
   const pdfBytes = await pdf.save();
   return new Blob([pdfBytes], { type: 'application/pdf' });
 };
 
-// 21. PDF to ZIP
-export const bundleToZip = async (files) => {
-  const zip = new JSZip();
-  for (let i = 0; i < files.length; i++) {
-    const f = files[i];
-    const b = await readFileAsArrayBuffer(f);
-    zip.file(f.name, b);
+// 21. N-Up PDF (Multiple pages per sheet: 2, 4, 9 pages)
+export const nUpPDF = async (file, { nUp = 2, orientation = 'landscape', drawBorder = true, margin = 16 } = {}) => {
+  const bytes = await readFileAsArrayBuffer(file);
+  const srcPdf = await PDFDocument.load(bytes, { ignoreEncryption: true });
+  const totalPages = srcPdf.getPageCount();
+  const newPdf = await PDFDocument.create();
+
+  const isLandscape = orientation === 'landscape';
+  const sheetWidth = isLandscape ? 842 : 595;
+  const sheetHeight = isLandscape ? 595 : 842;
+
+  const cols = nUp === 2 ? (isLandscape ? 2 : 1) : 2;
+  const rows = nUp === 2 ? (isLandscape ? 1 : 2) : 2;
+  const pagesPerSheet = cols * rows;
+
+  for (let i = 0; i < totalPages; i += pagesPerSheet) {
+    const sheet = newPdf.addPage([sheetWidth, sheetHeight]);
+    const m = Math.max(0, parseInt(margin, 10) || 12);
+    const cellW = (sheetWidth - m * (cols + 1)) / cols;
+    const cellH = (sheetHeight - m * (rows + 1)) / rows;
+
+    for (let p = 0; p < pagesPerSheet; p++) {
+      const pageIdx = i + p;
+      if (pageIdx >= totalPages) break;
+
+      const col = p % cols;
+      const row = Math.floor(p / cols);
+
+      const [embeddedPage] = await newPdf.embedPages([srcPdf.getPage(pageIdx)]);
+      const srcW = embeddedPage.width;
+      const srcH = embeddedPage.height;
+      const scale = Math.min(cellW / srcW, cellH / srcH);
+      const renderW = srcW * scale;
+      const renderH = srcH * scale;
+
+      const cellX = m + col * (cellW + m);
+      const cellY = sheetHeight - ((row + 1) * cellH + (row + 1) * m);
+
+      const posX = cellX + (cellW - renderW) / 2;
+      const posY = cellY + (cellH - renderH) / 2;
+
+      if (drawBorder) {
+        sheet.drawRectangle({
+          x: posX,
+          y: posY,
+          width: renderW,
+          height: renderH,
+          borderWidth: 0.75,
+          borderColor: rgb(0.8, 0.83, 0.88),
+        });
+      }
+
+      sheet.drawPage(embeddedPage, {
+        x: posX,
+        y: posY,
+        width: renderW,
+        height: renderH,
+      });
+    }
   }
+
+  const pdfBytes = await newPdf.save();
+  return new Blob([pdfBytes], { type: 'application/pdf' });
+};
+
+// 22. PDF to ZIP
+export const bundleToZip = async (files, { mode = 'bundle' } = {}) => {
+  const zip = new JSZip();
+
+  if (mode === 'extract-pages' && files.length > 0) {
+    for (const file of files) {
+      const bytes = await readFileAsArrayBuffer(file);
+      const pdf = await PDFDocument.load(bytes, { ignoreEncryption: true });
+      const baseName = file.name.replace(/\.[^/.]+$/, '');
+      const total = pdf.getPageCount();
+      for (let i = 0; i < total; i++) {
+        const pageDoc = await PDFDocument.create();
+        const [copied] = await pageDoc.copyPages(pdf, [i]);
+        pageDoc.addPage(copied);
+        zip.file(`${baseName}-page-${i + 1}.pdf`, await pageDoc.save());
+      }
+    }
+  } else {
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
+      const b = await readFileAsArrayBuffer(f);
+      zip.file(f.name, b);
+    }
+  }
+
   return await zip.generateAsync({ type: 'blob' });
 };
 
@@ -1049,4 +1462,224 @@ export const repairCorruptedPDF = async (file) => {
 
   return new Blob([repairedBytes], { type: 'application/pdf' });
 };
+
+// 29. HD Image Super-Resolution & Quality Enhancer
+export const upscaleImage = async (
+  imageFile,
+  {
+    scaleFactor = 2,
+    sharpen = 60,
+    denoise = 15,
+    contrast = 15,
+    preset = 'auto',
+    format = 'image/png'
+  } = {}
+) => {
+  const dataUrl = await readFileAsDataURL(imageFile);
+  const img = new Image();
+  await new Promise((resolve, reject) => {
+    img.onload = resolve;
+    img.onerror = reject;
+    img.src = dataUrl;
+  });
+
+  const origWidth = img.width;
+  const origHeight = img.height;
+  const targetWidth = Math.round(origWidth * scaleFactor);
+  const targetHeight = Math.round(origHeight * scaleFactor);
+
+  // Progressive high-quality bicubic-emulated resampling
+  let curCanvas = document.createElement('canvas');
+  curCanvas.width = origWidth;
+  curCanvas.height = origHeight;
+  let curCtx = curCanvas.getContext('2d');
+  curCtx.drawImage(img, 0, 0);
+
+  let curWidth = origWidth;
+  let curHeight = origHeight;
+
+  while (curWidth < targetWidth || curHeight < targetHeight) {
+    const nextWidth = Math.min(targetWidth, Math.round(curWidth * 1.5));
+    const nextHeight = Math.min(targetHeight, Math.round(curHeight * 1.5));
+
+    const stepCanvas = document.createElement('canvas');
+    stepCanvas.width = nextWidth;
+    stepCanvas.height = nextHeight;
+    const stepCtx = stepCanvas.getContext('2d');
+
+    stepCtx.imageSmoothingEnabled = true;
+    stepCtx.imageSmoothingQuality = 'high';
+    stepCtx.drawImage(curCanvas, 0, 0, curWidth, curHeight, 0, 0, nextWidth, nextHeight);
+
+    curCanvas = stepCanvas;
+    curWidth = nextWidth;
+    curHeight = nextHeight;
+  }
+
+  const finalCtx = curCanvas.getContext('2d');
+  const imgData = finalCtx.getImageData(0, 0, targetWidth, targetHeight);
+  const pixels = imgData.data;
+
+  // Clone buffer for multi-pass neighborhood processing
+  const srcBuffer = new Uint8ClampedArray(pixels);
+  const w = targetWidth;
+  const h = targetHeight;
+
+  // Adjust parameters based on chosen preset
+  let effectiveSharpen = sharpen;
+  let effectiveContrast = contrast;
+  let effectiveDenoise = denoise;
+  let threshold = 3;
+
+  if (preset === 'text') {
+    effectiveSharpen = Math.min(100, sharpen * 1.35);
+    effectiveContrast = Math.min(50, contrast * 1.5);
+    threshold = 1.5;
+  } else if (preset === 'art') {
+    effectiveSharpen = Math.min(100, sharpen * 1.2);
+    effectiveDenoise = Math.min(100, denoise * 1.4);
+  } else if (preset === 'photo') {
+    effectiveSharpen = sharpen * 0.95;
+    threshold = 4;
+  }
+
+  // --- PASS 1: Edge-Preserving Bilateral Denoising ---
+  if (effectiveDenoise > 0) {
+    const denoiseFactor = (effectiveDenoise / 100) * 0.6;
+    const colorThreshold = 28;
+
+    for (let y = 1; y < h - 1; y++) {
+      for (let x = 1; x < w - 1; x++) {
+        const idx = (y * w + x) * 4;
+        const r = srcBuffer[idx];
+        const g = srcBuffer[idx + 1];
+        const b = srcBuffer[idx + 2];
+
+        let sumR = r, sumG = g, sumB = b, count = 1;
+
+        const neighbors = [
+          ((y - 1) * w + x) * 4,
+          ((y + 1) * w + x) * 4,
+          (y * w + (x - 1)) * 4,
+          (y * w + (x + 1)) * 4,
+        ];
+
+        for (let k = 0; k < 4; k++) {
+          const nIdx = neighbors[k];
+          const nr = srcBuffer[nIdx];
+          const ng = srcBuffer[nIdx + 1];
+          const nb = srcBuffer[nIdx + 2];
+
+          const colorDiff = Math.abs(r - nr) + Math.abs(g - ng) + Math.abs(b - nb);
+          if (colorDiff < colorThreshold) {
+            sumR += nr;
+            sumG += ng;
+            sumB += nb;
+            count++;
+          }
+        }
+
+        if (count > 1) {
+          pixels[idx] = Math.round(r * (1 - denoiseFactor) + (sumR / count) * denoiseFactor);
+          pixels[idx + 1] = Math.round(g * (1 - denoiseFactor) + (sumG / count) * denoiseFactor);
+          pixels[idx + 2] = Math.round(b * (1 - denoiseFactor) + (sumB / count) * denoiseFactor);
+        }
+      }
+    }
+  }
+
+  // Sync buffer after Pass 1
+  const afterDenoiseBuffer = new Uint8ClampedArray(pixels);
+
+  // --- PASS 2: Contrast Adaptive Sharpening (CAS) ---
+  if (effectiveSharpen > 0) {
+    const sharpWeight = (effectiveSharpen / 100) * 2.0;
+
+    for (let y = 1; y < h - 1; y++) {
+      for (let x = 1; x < w - 1; x++) {
+        const idx = (y * w + x) * 4;
+
+        const top = ((y - 1) * w + x) * 4;
+        const btm = ((y + 1) * w + x) * 4;
+        const lft = (y * w + (x - 1)) * 4;
+        const rgt = (y * w + (x + 1)) * 4;
+        const tl  = ((y - 1) * w + (x - 1)) * 4;
+        const tr  = ((y - 1) * w + (x + 1)) * 4;
+        const bl  = ((y + 1) * w + (x - 1)) * 4;
+        const br  = ((y + 1) * w + (x + 1)) * 4;
+
+        for (let c = 0; c < 3; c++) {
+          const e = afterDenoiseBuffer[idx + c];
+          const b_val = afterDenoiseBuffer[top + c];
+          const d_val = afterDenoiseBuffer[lft + c];
+          const f_val = afterDenoiseBuffer[rgt + c];
+          const h_val = afterDenoiseBuffer[btm + c];
+
+          const a_val = afterDenoiseBuffer[tl + c];
+          const c_val = afterDenoiseBuffer[tr + c];
+          const g_val = afterDenoiseBuffer[bl + c];
+          const i_val = afterDenoiseBuffer[br + c];
+
+          const minVal = Math.min(e, b_val, d_val, f_val, h_val, a_val, c_val, g_val, i_val);
+          const maxVal = Math.max(e, b_val, d_val, f_val, h_val, a_val, c_val, g_val, i_val);
+          const delta = maxVal - minVal;
+
+          if (delta > threshold) {
+            const crossSum = (b_val + d_val + f_val + h_val) * 0.25;
+            const diagSum = (a_val + c_val + g_val + i_val) * 0.25;
+            const blurVal = crossSum * 0.65 + diagSum * 0.35;
+            const highFreq = e - blurVal;
+
+            const amp = Math.min(2.5, 1 + sharpWeight * (1 - Math.abs(2 * e - (minVal + maxVal)) / (delta + 1e-4)));
+            const sharpened = e + highFreq * amp * sharpWeight;
+
+            pixels[idx + c] = Math.min(255, Math.max(0, Math.round(sharpened)));
+          }
+        }
+      }
+    }
+  }
+
+  // --- PASS 3: Dynamic Micro-Contrast & Luminance Tone Expansion ---
+  if (effectiveContrast > 0) {
+    const contrastFactor = 1 + (effectiveContrast / 100) * 0.85;
+
+    for (let i = 0; i < pixels.length; i += 4) {
+      const r = pixels[i];
+      const g = pixels[i + 1];
+      const b = pixels[i + 2];
+
+      const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+      const normLum = lum / 255;
+      const sCurve = (normLum - 0.5) * contrastFactor + 0.5;
+      const lumBoost = Math.max(0, Math.min(1, sCurve)) * 255;
+      const diff = lumBoost - lum;
+
+      pixels[i] = Math.min(255, Math.max(0, Math.round(r + diff)));
+      pixels[i + 1] = Math.min(255, Math.max(0, Math.round(g + diff)));
+      pixels[i + 2] = Math.min(255, Math.max(0, Math.round(b + diff)));
+    }
+  }
+
+  finalCtx.putImageData(imgData, 0, 0);
+
+  const mimeType = format.startsWith('image/') ? format : `image/${format}`;
+  const hdDataUrl = curCanvas.toDataURL(mimeType, 0.95);
+
+  return new Promise((resolve) => {
+    curCanvas.toBlob((blob) => {
+      resolve({
+        blob,
+        hdDataUrl,
+        origDataUrl: dataUrl,
+        origWidth,
+        origHeight,
+        targetWidth,
+        targetHeight,
+        scaleFactor,
+      });
+    }, mimeType, 0.95);
+  });
+};
+
 

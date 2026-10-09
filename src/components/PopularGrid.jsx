@@ -6,10 +6,12 @@ import {
   Eraser, 
   FileText, 
   Scissors, 
-  ArrowUpRight 
+  ArrowUpRight,
+  Sparkles
 } from 'lucide-react';
 
 const ICON_MAP = {
+  'upscale-image': Sparkles,
   'compress-pdf': Layers,
   'edit-pdf': PenLine,
   'sign-pdf': PenLine,

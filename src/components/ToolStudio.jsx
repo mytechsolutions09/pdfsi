@@ -13,12 +13,25 @@ import {
   Send,
   Eye,
   Eraser,
-  Lock
+  Lock,
+  Copy,
+  ArrowUp,
+  ArrowDown,
+  ArrowLeft,
+  ArrowRight,
+  RotateCw,
+  Layers,
+  Grid,
+  Columns2,
+  Shuffle
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { 
   mergePDFs, 
   splitPDF, 
+  splitPDFByText,
+  splitPDFBySize,
+  splitPDFByBookmarks,
   compressPDF, 
   rotatePDF, 
   addWatermarkPDF, 
@@ -36,7 +49,10 @@ import {
   alternateMixPDFs,
   flipPDF,
   cropResizePDF,
+  nUpPDF,
+  organizePagesPDF,
   bundleToZip,
+  getPDFPageCount,
   invertPDFColors,
   redactPDF,
   generateResumePDF,
@@ -44,6 +60,7 @@ import {
   convertCSVToPDF,
   convertTextToHandwritingPDF,
   repairCorruptedPDF,
+  upscaleImage,
   downloadBlob 
 } from '../services/pdfEngine';
 import { summarizeLocally, scanPII, answerPDFQuestion } from '../services/aiEngine';
@@ -62,6 +79,24 @@ export default function ToolStudio({ tool, onClose, onSaveRecent }) {
   const [splitMode, setSplitMode] = useState('all');
   const [splitRange, setSplitRange] = useState('1-2');
   const [rotateAngle, setRotateAngle] = useState(90);
+  const [rotateFilter, setRotateFilter] = useState('all'); // 'all' | 'odd' | 'even'
+  const [compressLevel, setCompressLevel] = useState('recommended'); // 'recommended' | 'extreme' | 'less'
+  const [mixReverseSecond, setMixReverseSecond] = useState(false);
+  const [splitTextKeyword, setSplitTextKeyword] = useState('Chapter');
+  const [splitTextCase, setSplitTextCase] = useState(false);
+  const [splitBookmarkInterval, setSplitBookmarkInterval] = useState(5);
+  const [splitHalfMethod, setSplitHalfMethod] = useState('pages'); // 'pages' | 'spread'
+  const [splitTargetMB, setSplitTargetMB] = useState(10);
+  const [flipDirection, setFlipDirection] = useState('both');
+  const [nUpCount, setNUpCount] = useState(2); // 2 | 4 | 9
+  const [nUpOrientation, setNUpOrientation] = useState('landscape'); // 'landscape' | 'portrait'
+  const [nUpBorder, setNUpBorder] = useState(true);
+  const [nUpMargin, setNUpMargin] = useState(16);
+  const [cropPreset, setCropPreset] = useState('margin'); // 'margin' | 'a4' | 'letter' | 'legal'
+  const [cropMargin, setCropMargin] = useState(20);
+  const [zipMode, setZipMode] = useState('bundle'); // 'bundle' | 'extract-pages'
+  const [organizePages, setOrganizePages] = useState([]); // [{ id, originalIndex, pageNumber, rotation }]
+  const [organizeLoading, setOrganizeLoading] = useState(false);
   const [pageNumberFormat, setPageNumberFormat] = useState('Page {n} of {total}');
   const [pageNumberPos, setPageNumberPos] = useState('bottom-center');
   const [batesPrefix, setBatesPrefix] = useState('LEGAL-');
@@ -70,8 +105,178 @@ export default function ToolStudio({ tool, onClose, onSaveRecent }) {
   const [footerText, setFooterText] = useState('STRICTLY PRIVATE');
   const [metaTitle, setMetaTitle] = useState('');
   const [metaAuthor, setMetaAuthor] = useState('');
-  const [metaSubject, setMetaSubject] = useState('');
-  const [bgTolerance, setBgTolerance] = useState(35);
+  // Background Removal State
+  const [bgTolerance, setBgTolerance] = useState(32);
+  const [bgEdgeSmooth, setBgEdgeSmooth] = useState(2);
+  const [bgReplacement, setBgReplacement] = useState('transparent');
+  const [bgCutoutPreviewUrl, setBgCutoutPreviewUrl] = useState(null);
+  const [bgOrigPreviewUrl, setBgOrigPreviewUrl] = useState(null);
+  const [bgCompareMode, setBgCompareMode] = useState('split');
+  const [bgSplitPos, setBgSplitPos] = useState(50);
+  
+  // HD Image Upscaler State
+  const [upscaleFactor, setUpscaleFactor] = useState(2);
+  const [upscaleSharpen, setUpscaleSharpen] = useState(65);
+  const [upscaleDenoise, setUpscaleDenoise] = useState(15);
+  const [upscaleContrast, setUpscaleContrast] = useState(20);
+  const [upscaleFormat, setUpscaleFormat] = useState('image/png');
+  const [upscalePreviewInfo, setUpscalePreviewInfo] = useState(null);
+  const [hdPreviewUrl, setHdPreviewUrl] = useState(null);
+  const [origPreviewUrl, setOrigPreviewUrl] = useState(null);
+  const [compareMode, setCompareMode] = useState('split'); // 'split' | 'hd' | 'orig'
+  const [splitPos, setSplitPos] = useState(50); // percentage 0 - 100
+  const [isDraggingSplit, setIsDraggingSplit] = useState(false);
+
+  const handleSliderPointerDown = (e, setPos) => {
+    setIsDraggingSplit(true);
+    try { e.currentTarget.setPointerCapture(e.pointerId); } catch (_) {}
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    setPos(Math.round(Math.max(0, Math.min(100, (x / rect.width) * 100))));
+  };
+
+  const handleSliderPointerMove = (e, setPos) => {
+    if (!isDraggingSplit) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    setPos(Math.round(Math.max(0, Math.min(100, (x / rect.width) * 100))));
+  };
+
+  const handleSliderPointerUp = () => {
+    setIsDraggingSplit(false);
+  };
+
+  // Dynamic HD resolution info calculation
+  useEffect(() => {
+    if (tool.actionType === 'upscale-image' && files.length > 0 && files[0]?.type?.startsWith('image/')) {
+      const primaryFile = files[0];
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        setOrigPreviewUrl(e.target.result);
+        const img = new Image();
+        img.onload = () => {
+          setUpscalePreviewInfo({
+            origWidth: img.width,
+            origHeight: img.height,
+            targetWidth: Math.round(img.width * upscaleFactor),
+            targetHeight: Math.round(img.height * upscaleFactor),
+            scaleFactor: upscaleFactor
+          });
+        };
+        img.src = e.target.result;
+      };
+      reader.readAsDataURL(primaryFile);
+    } else {
+      setHdPreviewUrl(null);
+      setOrigPreviewUrl(null);
+    }
+  }, [upscaleFactor, files, tool.actionType]);
+
+  // Background removal original image reader
+  useEffect(() => {
+    if (tool.actionType === 'bg-remove' && files.length > 0 && files[0]?.type?.startsWith('image/')) {
+      const primaryFile = files[0];
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        setBgOrigPreviewUrl(e.target.result);
+      };
+      reader.readAsDataURL(primaryFile);
+    } else if (tool.actionType === 'bg-remove') {
+      setBgCutoutPreviewUrl(null);
+      setBgOrigPreviewUrl(null);
+    }
+  }, [files, tool.actionType]);
+
+  // Initialize Page Management organizer when PDF is loaded
+  useEffect(() => {
+    if (tool.actionType === 'organize' && files.length > 0) {
+      setOrganizeLoading(true);
+      getPDFPageCount(files[0])
+        .then((count) => {
+          const pages = Array.from({ length: count }, (_, i) => ({
+            id: `p-${i + 1}-${Date.now()}`,
+            originalIndex: i,
+            pageNumber: i + 1,
+            rotation: 0
+          }));
+          setOrganizePages(pages);
+        })
+        .catch(() => {
+          setOrganizePages([{ id: 'p-1', originalIndex: 0, pageNumber: 1, rotation: 0 }]);
+        })
+        .finally(() => {
+          setOrganizeLoading(false);
+        });
+    } else if (tool.actionType === 'organize' && files.length === 0) {
+      setOrganizePages([]);
+    }
+  }, [files, tool.actionType]);
+
+  const moveOrganizePage = (index, direction) => {
+    const targetIndex = index + direction;
+    if (targetIndex < 0 || targetIndex >= organizePages.length) return;
+    const next = [...organizePages];
+    const temp = next[index];
+    next[index] = next[targetIndex];
+    next[targetIndex] = temp;
+    setOrganizePages(next);
+  };
+
+  const rotateOrganizePage = (index) => {
+    const next = [...organizePages];
+    next[index] = { ...next[index], rotation: (next[index].rotation + 90) % 360 };
+    setOrganizePages(next);
+  };
+
+  const duplicateOrganizePage = (index) => {
+    const next = [...organizePages];
+    const source = next[index];
+    const copy = { ...source, id: `p-copy-${Date.now()}-${Math.random()}` };
+    next.splice(index + 1, 0, copy);
+    setOrganizePages(next);
+  };
+
+  const deleteOrganizePage = (index) => {
+    if (organizePages.length <= 1) {
+      alert('Document must contain at least 1 page.');
+      return;
+    }
+    const next = organizePages.filter((_, i) => i !== index);
+    setOrganizePages(next);
+  };
+
+  const rotateAllOrganizePages = (angle = 90) => {
+    setOrganizePages((prev) => prev.map((p) => ({ ...p, rotation: (p.rotation + angle) % 360 })));
+  };
+
+  const reverseOrganizePages = () => {
+    setOrganizePages((prev) => [...prev].reverse());
+  };
+
+  const resetOrganizePages = () => {
+    if (files.length > 0) {
+      getPDFPageCount(files[0]).then((count) => {
+        setOrganizePages(
+          Array.from({ length: count }, (_, i) => ({
+            id: `p-${i + 1}-${Date.now()}`,
+            originalIndex: i,
+            pageNumber: i + 1,
+            rotation: 0
+          }))
+        );
+      });
+    }
+  };
+
+  const moveFile = (index, direction) => {
+    const targetIndex = index + direction;
+    if (targetIndex < 0 || targetIndex >= files.length) return;
+    const next = [...files];
+    const temp = next[index];
+    next[index] = next[targetIndex];
+    next[targetIndex] = temp;
+    setFiles(next);
+  };
   
   // Markdown / Text to PDF state
   const [markdownContent, setMarkdownContent] = useState(
@@ -218,43 +423,86 @@ export default function ToolStudio({ tool, onClose, onSaveRecent }) {
 
         case 'alternate-mix':
           if (files.length < 2) throw new Error('Please select at least 2 PDF files to interleave.');
-          outputBlob = await alternateMixPDFs(files);
+          outputBlob = await alternateMixPDFs(files, { reverseSecond: mixReverseSecond });
           outputFilename = `interleaved-${Date.now()}.pdf`;
           break;
 
         case 'split':
-        case 'split-half':
-        case 'split-text':
-        case 'split-size':
-        case 'split-bookmarks':
           if (files.length === 0) throw new Error('Please select a PDF file to split.');
-          const splitRes = await splitPDF(files[0], { mode: tool.actionType === 'split-half' ? 'half' : splitMode, ranges: splitRange });
+          const splitRes = await splitPDF(files[0], { mode: splitMode, ranges: splitRange });
           outputBlob = splitRes.blob;
           outputFilename = splitRes.filename;
           break;
 
+        case 'split-half':
+          if (files.length === 0) throw new Error('Please select a PDF file to split.');
+          const halfRes = await splitPDF(files[0], { mode: splitHalfMethod === 'spread' ? 'spread' : 'half' });
+          outputBlob = halfRes.blob;
+          outputFilename = halfRes.filename;
+          break;
+
+        case 'split-text':
+          if (files.length === 0) throw new Error('Please select a PDF file to split.');
+          const textRes = await splitPDFByText(files[0], { keyword: splitTextKeyword, caseSensitive: splitTextCase });
+          outputBlob = textRes.blob;
+          outputFilename = textRes.filename;
+          break;
+
+        case 'split-size':
+          if (files.length === 0) throw new Error('Please select a PDF file to split.');
+          const sizeRes = await splitPDFBySize(files[0], { maxMB: splitTargetMB });
+          outputBlob = sizeRes.blob;
+          outputFilename = sizeRes.filename;
+          break;
+
+        case 'split-bookmarks':
+          if (files.length === 0) throw new Error('Please select a PDF file to split.');
+          const bmRes = await splitPDFByBookmarks(files[0], { chapterInterval: splitBookmarkInterval });
+          outputBlob = bmRes.blob;
+          outputFilename = bmRes.filename;
+          break;
+
+        case 'organize':
+          if (files.length === 0) throw new Error('Please select a PDF file to organize.');
+          if (organizePages.length === 0) throw new Error('Document has no pages selected.');
+          outputBlob = await organizePagesPDF(files[0], {
+            pageOrder: organizePages.map((p) => ({ originalIndex: p.originalIndex, rotation: p.rotation }))
+          });
+          outputFilename = `organized-${files[0].name}`;
+          break;
+
         case 'compress':
           if (files.length === 0) throw new Error('Please select a PDF to compress.');
-          outputBlob = await compressPDF(files[0]);
+          outputBlob = await compressPDF(files[0], { level: compressLevel });
           outputFilename = `compressed-${files[0].name}`;
           break;
 
         case 'rotate':
           if (files.length === 0) throw new Error('Please select a PDF to rotate.');
-          outputBlob = await rotatePDF(files[0], { angle: rotateAngle });
+          outputBlob = await rotatePDF(files[0], { angle: rotateAngle, pageFilter: rotateFilter });
           outputFilename = `rotated-${files[0].name}`;
           break;
 
         case 'flip':
           if (files.length === 0) throw new Error('Please select a PDF to flip.');
-          outputBlob = await flipPDF(files[0]);
+          outputBlob = await flipPDF(files[0], { direction: flipDirection });
           outputFilename = `flipped-${files[0].name}`;
           break;
 
-        case 'crop-resize':
         case 'n-up':
+          if (files.length === 0) throw new Error('Please select a PDF for N-Up.');
+          outputBlob = await nUpPDF(files[0], {
+            nUp: nUpCount,
+            orientation: nUpOrientation,
+            drawBorder: nUpBorder,
+            margin: nUpMargin
+          });
+          outputFilename = `n-up-${nUpCount}x-${files[0].name}`;
+          break;
+
+        case 'crop-resize':
           if (files.length === 0) throw new Error('Please select a PDF.');
-          outputBlob = await cropResizePDF(files[0]);
+          outputBlob = await cropResizePDF(files[0], { preset: cropPreset, margin: cropMargin });
           outputFilename = `resized-${files[0].name}`;
           break;
 
@@ -401,8 +649,34 @@ export default function ToolStudio({ tool, onClose, onSaveRecent }) {
         case 'bg-remove':
         case 'thumbmark':
           if (files.length === 0) throw new Error('Please select an image file.');
-          outputBlob = await removeImageBackground(files[0], { tolerance: bgTolerance });
-          outputFilename = `cutout-${files[0].name.replace(/\.[^/.]+$/, '')}.png`;
+          setStatusMessage('Detecting subject contours & removing background...');
+          const bgRes = await removeImageBackground(files[0], {
+            tolerance: bgTolerance,
+            edgeSmooth: bgEdgeSmooth,
+            bgColor: bgReplacement,
+            defringe: true,
+          });
+          outputBlob = bgRes.blob;
+          setBgCutoutPreviewUrl(bgRes.cutoutDataUrl);
+          const bgExt = bgReplacement === 'transparent' ? 'png' : 'jpg';
+          outputFilename = `cutout-${files[0].name.replace(/\.[^/.]+$/, '')}.${bgExt}`;
+          break;
+
+        case 'upscale-image':
+          if (files.length === 0) throw new Error('Please select an image to upgrade to HD.');
+          setStatusMessage('Processing AI Super-Resolution & detail reconstruction...');
+          const upRes = await upscaleImage(files[0], {
+            scaleFactor: upscaleFactor,
+            sharpen: upscaleSharpen,
+            denoise: upscaleDenoise,
+            contrast: upscaleContrast,
+            format: upscaleFormat,
+          });
+          outputBlob = upRes.blob;
+          setUpscalePreviewInfo(upRes);
+          setHdPreviewUrl(upRes.hdDataUrl);
+          const ext = upscaleFormat.includes('jpeg') ? 'jpg' : upscaleFormat.includes('webp') ? 'webp' : 'png';
+          outputFilename = `HD-${upscaleFactor}x-${files[0].name.replace(/\.[^/.]+$/, '')}.${ext}`;
           break;
 
         case 'extract-text':
@@ -658,6 +932,590 @@ export default function ToolStudio({ tool, onClose, onSaveRecent }) {
                   </div>
                 )}
               </div>
+            ) : tool.actionType === 'upscale-image' && hdPreviewUrl ? (
+              // Interactive HD Before vs After Quality Comparison
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'var(--bg-input)', padding: '6px 12px', borderRadius: 'var(--radius-md)', border: '1px solid var(--border-subtle)' }}>
+                  <span style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--accent-green)', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <Sparkles size={14} /> Quality Comparison
+                  </span>
+                  <div style={{ display: 'flex', gap: '4px' }}>
+                    {[
+                      { id: 'split', label: 'Split Slider' },
+                      { id: 'orig', label: 'Original 1x' },
+                      { id: 'hd', label: 'HD Enhanced ✨' },
+                    ].map((mode) => (
+                      <button
+                        key={mode.id}
+                        type="button"
+                        onClick={() => setCompareMode(mode.id)}
+                        style={{
+                          padding: '4px 10px',
+                          fontSize: '0.74rem',
+                          borderRadius: '6px',
+                          border: 'none',
+                          cursor: 'pointer',
+                          fontWeight: compareMode === mode.id ? 700 : 500,
+                          background: compareMode === mode.id ? 'var(--brand-red)' : 'transparent',
+                          color: compareMode === mode.id ? '#fff' : 'var(--text-secondary)',
+                          transition: 'all 0.15s ease'
+                        }}
+                      >
+                        {mode.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Viewport */}
+                <div style={{
+                  position: 'relative',
+                  width: '100%',
+                  height: '350px',
+                  borderRadius: 'var(--radius-lg)',
+                  overflow: 'hidden',
+                  border: '1px solid var(--border-subtle)',
+                  background: '#090d14',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center'
+                }}>
+                  {compareMode === 'orig' && (
+                    <img src={origPreviewUrl} alt="Original Low-Def" style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} />
+                  )}
+                  {compareMode === 'hd' && (
+                    <img src={hdPreviewUrl} alt="HD Enhanced" style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} />
+                  )}
+                  {compareMode === 'split' && (
+                    <div
+                      style={{
+                        position: 'relative',
+                        width: '100%',
+                        height: '100%',
+                        overflow: 'hidden',
+                        cursor: 'ew-resize',
+                        touchAction: 'none',
+                        userSelect: 'none'
+                      }}
+                      onPointerDown={(e) => handleSliderPointerDown(e, setSplitPos)}
+                      onPointerMove={(e) => handleSliderPointerMove(e, setSplitPos)}
+                      onPointerUp={handleSliderPointerUp}
+                    >
+                      {/* Base Image: HD Enhanced */}
+                      <img
+                        src={hdPreviewUrl}
+                        alt="HD"
+                        style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', objectFit: 'contain', pointerEvents: 'none' }}
+                      />
+
+                      {/* Top Image: Original (Clipped cleanly at split percentage) */}
+                      <img
+                        src={origPreviewUrl}
+                        alt="Original"
+                        style={{
+                          position: 'absolute',
+                          top: 0,
+                          left: 0,
+                          width: '100%',
+                          height: '100%',
+                          objectFit: 'contain',
+                          clipPath: `polygon(0 0, ${splitPos}% 0, ${splitPos}% 100%, 0 100%)`,
+                          WebkitClipPath: `polygon(0 0, ${splitPos}% 0, ${splitPos}% 100%, 0 100%)`,
+                          pointerEvents: 'none'
+                        }}
+                      />
+
+                      {/* Interactive Draggable Split Divider Line */}
+                      <div
+                        style={{
+                          position: 'absolute',
+                          top: 0,
+                          bottom: 0,
+                          left: `${splitPos}%`,
+                          width: '2.5px',
+                          background: '#ffffff',
+                          transform: 'translateX(-50%)',
+                          boxShadow: '0 0 12px rgba(0, 0, 0, 0.8), 0 0 4px rgba(255, 255, 255, 0.8)',
+                          zIndex: 10,
+                          pointerEvents: 'none'
+                        }}
+                      >
+                        {/* Interactive Center Slider Handle Knob */}
+                        <div
+                          style={{
+                            position: 'absolute',
+                            top: '50%',
+                            left: '50%',
+                            transform: `translate(-50%, -50%) ${isDraggingSplit ? 'scale(1.12)' : 'scale(1)'}`,
+                            width: '42px',
+                            height: '42px',
+                            borderRadius: '50%',
+                            background: '#ffffff',
+                            border: '3px solid #0f172a',
+                            boxShadow: '0 4px 18px rgba(0, 0, 0, 0.6), 0 0 0 2px rgba(255, 255, 255, 0.8)',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            color: '#0f172a',
+                            cursor: 'ew-resize',
+                            pointerEvents: 'auto',
+                            transition: 'transform 0.12s ease'
+                          }}
+                        >
+                          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#0f172a" strokeWidth="2.8" strokeLinecap="round" strokeLinejoin="round">
+                            <polyline points="8 7 3 12 8 17" />
+                            <polyline points="16 7 21 12 16 17" />
+                          </svg>
+                        </div>
+                      </div>
+
+                      <div style={{
+                        position: 'absolute',
+                        bottom: '10px',
+                        left: '10px',
+                        background: 'rgba(15, 23, 42, 0.85)',
+                        color: '#fff',
+                        fontSize: '0.72rem',
+                        padding: '3px 8px',
+                        borderRadius: '4px',
+                        fontWeight: 600,
+                        backdropFilter: 'blur(4px)',
+                        zIndex: 11,
+                        pointerEvents: 'none'
+                      }}>
+                        Original ({upscalePreviewInfo?.origWidth}×{upscalePreviewInfo?.origHeight})
+                      </div>
+
+                      <div style={{
+                        position: 'absolute',
+                        bottom: '10px',
+                        right: '10px',
+                        background: 'rgba(16, 185, 129, 0.9)',
+                        color: '#fff',
+                        fontSize: '0.72rem',
+                        padding: '3px 8px',
+                        borderRadius: '4px',
+                        fontWeight: 700,
+                        backdropFilter: 'blur(4px)',
+                        zIndex: 11,
+                        pointerEvents: 'none'
+                      }}>
+                        HD Enhanced ({upscalePreviewInfo?.targetWidth}×{upscalePreviewInfo?.targetHeight}) ✨
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {compareMode === 'split' && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '0 4px' }}>
+                    <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>Drag Split Slider:</span>
+                    <input
+                      type="range"
+                      min="5"
+                      max="95"
+                      value={splitPos}
+                      onChange={(e) => setSplitPos(Number(e.target.value))}
+                      style={{ flex: 1 }}
+                    />
+                    <span style={{ fontSize: '0.75rem', fontWeight: 600, minWidth: '35px' }}>{splitPos}%</span>
+                  </div>
+                )}
+
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', paddingTop: '4px' }}>
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    style={{ padding: '5px 12px', fontSize: '0.78rem' }}
+                    onClick={() => { setHdPreviewUrl(null); setFiles([]); setDownloadReady(null); }}
+                  >
+                    Select Different Image
+                  </button>
+                  <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                    {upscaleFactor}x Super-Resolution Applied
+                  </span>
+                </div>
+              </div>
+            ) : tool.actionType === 'bg-remove' && bgCutoutPreviewUrl ? (
+              // Interactive Background Cutout Preview with Authentic Checkerboard Transparency
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'var(--bg-input)', padding: '6px 12px', borderRadius: 'var(--radius-md)', border: '1px solid var(--border-subtle)' }}>
+                  <span style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--accent-green)', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <Check size={14} /> Background Removed
+                  </span>
+                  <div style={{ display: 'flex', gap: '4px' }}>
+                    {[
+                      { id: 'split', label: 'Split Slider' },
+                      { id: 'orig', label: 'Original' },
+                      { id: 'cutout', label: 'Cutout Result ✨' },
+                    ].map((m) => (
+                      <button
+                        key={m.id}
+                        type="button"
+                        onClick={() => setBgCompareMode(m.id)}
+                        style={{
+                          padding: '4px 10px',
+                          fontSize: '0.74rem',
+                          borderRadius: '6px',
+                          border: 'none',
+                          cursor: 'pointer',
+                          fontWeight: bgCompareMode === m.id ? 700 : 500,
+                          background: bgCompareMode === m.id ? 'var(--brand-red)' : 'transparent',
+                          color: bgCompareMode === m.id ? '#fff' : 'var(--text-secondary)'
+                        }}
+                      >
+                        {m.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Viewport with Checkerboard pattern for authentic transparency */}
+                <div style={{
+                  position: 'relative',
+                  width: '100%',
+                  height: '350px',
+                  borderRadius: 'var(--radius-lg)',
+                  overflow: 'hidden',
+                  border: '1px solid var(--border-subtle)',
+                  backgroundImage: `
+                    linear-gradient(45deg, #182234 25%, transparent 25%), 
+                    linear-gradient(-45deg, #182234 25%, transparent 25%), 
+                    linear-gradient(45deg, transparent 75%, #182234 75%), 
+                    linear-gradient(-45deg, transparent 75%, #182234 75%)
+                  `,
+                  backgroundSize: '20px 20px',
+                  backgroundPosition: '0 0, 0 10px, 10px -10px, -10px 0px',
+                  backgroundColor: '#0c131f',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center'
+                }}>
+                  {bgCompareMode === 'orig' && (
+                    <img src={bgOrigPreviewUrl} alt="Original" style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} />
+                  )}
+                  {bgCompareMode === 'cutout' && (
+                    <img src={bgCutoutPreviewUrl} alt="Cutout" style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} />
+                  )}
+                  {bgCompareMode === 'split' && (
+                    <div 
+                      style={{ 
+                        position: 'relative', 
+                        width: '100%', 
+                        height: '100%', 
+                        overflow: 'hidden',
+                        cursor: 'ew-resize',
+                        touchAction: 'none',
+                        userSelect: 'none'
+                      }}
+                      onPointerDown={(e) => handleSliderPointerDown(e, setBgSplitPos)}
+                      onPointerMove={(e) => handleSliderPointerMove(e, setBgSplitPos)}
+                      onPointerUp={handleSliderPointerUp}
+                    >
+                      {/* Base Image: Cutout */}
+                      <img
+                        src={bgCutoutPreviewUrl}
+                        alt="Cutout"
+                        style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', objectFit: 'contain', pointerEvents: 'none' }}
+                      />
+
+                      {/* Top Image: Original Photo (Clipped cleanly at split percentage) */}
+                      <img
+                        src={bgOrigPreviewUrl}
+                        alt="Original"
+                        style={{
+                          position: 'absolute',
+                          top: 0,
+                          left: 0,
+                          width: '100%',
+                          height: '100%',
+                          objectFit: 'contain',
+                          clipPath: `polygon(0 0, ${bgSplitPos}% 0, ${bgSplitPos}% 100%, 0 100%)`,
+                          WebkitClipPath: `polygon(0 0, ${bgSplitPos}% 0, ${bgSplitPos}% 100%, 0 100%)`,
+                          pointerEvents: 'none'
+                        }}
+                      />
+
+                      {/* Interactive Draggable Split Divider Line */}
+                      <div
+                        style={{
+                          position: 'absolute',
+                          top: 0,
+                          bottom: 0,
+                          left: `${bgSplitPos}%`,
+                          width: '2.5px',
+                          background: '#ffffff',
+                          transform: 'translateX(-50%)',
+                          boxShadow: '0 0 12px rgba(0, 0, 0, 0.8), 0 0 4px rgba(255, 255, 255, 0.8)',
+                          zIndex: 10,
+                          pointerEvents: 'none'
+                        }}
+                      >
+                        {/* Interactive Center Slider Handle Knob */}
+                        <div
+                          style={{
+                            position: 'absolute',
+                            top: '50%',
+                            left: '50%',
+                            transform: `translate(-50%, -50%) ${isDraggingSplit ? 'scale(1.12)' : 'scale(1)'}`,
+                            width: '42px',
+                            height: '42px',
+                            borderRadius: '50%',
+                            background: '#ffffff',
+                            border: '3px solid #0f172a',
+                            boxShadow: '0 4px 18px rgba(0, 0, 0, 0.6), 0 0 0 2px rgba(255, 255, 255, 0.8)',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            color: '#0f172a',
+                            cursor: 'ew-resize',
+                            pointerEvents: 'auto',
+                            transition: 'transform 0.12s ease'
+                          }}
+                        >
+                          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#0f172a" strokeWidth="2.8" strokeLinecap="round" strokeLinejoin="round">
+                            <polyline points="8 7 3 12 8 17" />
+                            <polyline points="16 7 21 12 16 17" />
+                          </svg>
+                        </div>
+                      </div>
+
+                      {/* Labels */}
+                      <div style={{
+                        position: 'absolute',
+                        bottom: '10px',
+                        left: '10px',
+                        background: 'rgba(15, 23, 42, 0.85)',
+                        color: '#fff',
+                        fontSize: '0.72rem',
+                        padding: '3px 8px',
+                        borderRadius: '4px',
+                        fontWeight: 600,
+                        backdropFilter: 'blur(4px)',
+                        pointerEvents: 'none'
+                      }}>
+                        Original Photo
+                      </div>
+
+                      <div style={{
+                        position: 'absolute',
+                        bottom: '10px',
+                        right: '10px',
+                        background: 'rgba(16, 185, 129, 0.9)',
+                        color: '#fff',
+                        fontSize: '0.72rem',
+                        padding: '3px 8px',
+                        borderRadius: '4px',
+                        fontWeight: 700,
+                        backdropFilter: 'blur(4px)',
+                        pointerEvents: 'none'
+                      }}>
+                        Transparent Cutout ✨
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {bgCompareMode === 'split' && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '0 4px' }}>
+                    <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>Slide to compare:</span>
+                    <input
+                      type="range"
+                      min="5"
+                      max="95"
+                      value={bgSplitPos}
+                      onChange={(e) => setBgSplitPos(Number(e.target.value))}
+                      style={{ flex: 1 }}
+                    />
+                    <span style={{ fontSize: '0.75rem', fontWeight: 600, minWidth: '35px' }}>{bgSplitPos}%</span>
+                  </div>
+                )}
+
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', paddingTop: '4px' }}>
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    style={{ padding: '5px 12px', fontSize: '0.78rem' }}
+                    onClick={() => { setBgCutoutPreviewUrl(null); setFiles([]); setDownloadReady(null); }}
+                  >
+                    Select Different Image
+                  </button>
+                  <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                    Clean PNG with Alpha Transparency
+                  </span>
+                </div>
+              </div>
+            ) : tool.actionType === 'organize' && files.length > 0 ? (
+              // Visual Page Organizer Workspace
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'var(--bg-input)', padding: '10px 14px', borderRadius: 'var(--radius-md)', border: '1px solid var(--border-subtle)', flexWrap: 'wrap', gap: '8px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <Layers size={16} style={{ color: 'var(--brand-red)' }} />
+                    <span style={{ fontSize: '0.85rem', fontWeight: 700 }}>
+                      {files[0].name} ({organizePages.length} Pages)
+                    </span>
+                  </div>
+                  <div style={{ display: 'flex', gap: '6px' }}>
+                    <button
+                      type="button"
+                      className="btn-secondary"
+                      style={{ padding: '4px 10px', fontSize: '0.74rem', gap: '4px' }}
+                      onClick={() => rotateAllOrganizePages(90)}
+                      title="Rotate all pages 90° clockwise"
+                    >
+                      <RotateCw size={13} /> Rotate All 90°
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-secondary"
+                      style={{ padding: '4px 10px', fontSize: '0.74rem', gap: '4px' }}
+                      onClick={reverseOrganizePages}
+                      title="Reverse entire document page order"
+                    >
+                      <Shuffle size={13} /> Reverse Order
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-secondary"
+                      style={{ padding: '4px 10px', fontSize: '0.74rem', gap: '4px' }}
+                      onClick={resetOrganizePages}
+                      title="Reset pages back to original order"
+                    >
+                      <RefreshCw size={13} /> Reset
+                    </button>
+                  </div>
+                </div>
+
+                {organizeLoading ? (
+                  <div style={{ padding: '40px', textAlign: 'center', color: 'var(--text-muted)' }}>
+                    <RefreshCw size={24} className="spin" style={{ margin: '0 auto 10px' }} />
+                    <div>Reading document structure & pages...</div>
+                  </div>
+                ) : (
+                  <div style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'repeat(auto-fill, minmax(130px, 1fr))',
+                    gap: '12px',
+                    maxHeight: '440px',
+                    overflowY: 'auto',
+                    padding: '6px 2px'
+                  }}>
+                    {organizePages.map((page, idx) => (
+                      <div
+                        key={page.id}
+                        style={{
+                          background: 'var(--bg-card)',
+                          border: '1.5px solid var(--border-subtle)',
+                          borderRadius: 'var(--radius-md)',
+                          padding: '10px',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          alignItems: 'center',
+                          gap: '8px',
+                          position: 'relative',
+                          boxShadow: 'var(--shadow-sm)'
+                        }}
+                      >
+                        {/* Page Number & Rotation */}
+                        <div style={{ display: 'flex', justifyContent: 'space-between', width: '100%', fontSize: '0.74rem', fontWeight: 700, color: 'var(--text-secondary)' }}>
+                          <span>Page {page.pageNumber}</span>
+                          {page.rotation > 0 && (
+                            <span style={{ color: 'var(--brand-red)', fontSize: '0.68rem' }}>{page.rotation}°</span>
+                          )}
+                        </div>
+
+                        {/* Visual Paper Thumbnail */}
+                        <div
+                          style={{
+                            width: '75px',
+                            height: '100px',
+                            background: '#ffffff',
+                            borderRadius: '4px',
+                            border: '1px solid #cbd5e1',
+                            display: 'flex',
+                            flexDirection: 'column',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            boxShadow: '0 2px 6px rgba(0,0,0,0.12)',
+                            transform: `rotate(${page.rotation}deg)`,
+                            transition: 'transform 0.2s ease',
+                            color: '#0f172a'
+                          }}
+                        >
+                          <FileText size={26} style={{ color: '#64748b', opacity: 0.8 }} />
+                          <span style={{ fontSize: '0.7rem', fontWeight: 800, color: '#334155', marginTop: '4px' }}>
+                            {page.pageNumber}
+                          </span>
+                        </div>
+
+                        {/* Page Controls */}
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '3px', marginTop: '2px' }}>
+                          <button
+                            type="button"
+                            className="icon-btn"
+                            disabled={idx === 0}
+                            onClick={() => moveOrganizePage(idx, -1)}
+                            title="Move Page Earlier"
+                            style={{ padding: '3px', border: 'none', background: 'transparent', opacity: idx === 0 ? 0.3 : 1, cursor: idx === 0 ? 'default' : 'pointer' }}
+                          >
+                            <ArrowLeft size={13} />
+                          </button>
+                          <button
+                            type="button"
+                            className="icon-btn"
+                            disabled={idx === organizePages.length - 1}
+                            onClick={() => moveOrganizePage(idx, 1)}
+                            title="Move Page Later"
+                            style={{ padding: '3px', border: 'none', background: 'transparent', opacity: idx === organizePages.length - 1 ? 0.3 : 1, cursor: idx === organizePages.length - 1 ? 'default' : 'pointer' }}
+                          >
+                            <ArrowRight size={13} />
+                          </button>
+                          <button
+                            type="button"
+                            className="icon-btn"
+                            onClick={() => rotateOrganizePage(idx)}
+                            title="Rotate 90° Clockwise"
+                            style={{ padding: '3px', border: 'none', background: 'transparent', cursor: 'pointer' }}
+                          >
+                            <RotateCw size={13} style={{ color: 'var(--brand-red)' }} />
+                          </button>
+                          <button
+                            type="button"
+                            className="icon-btn"
+                            onClick={() => duplicateOrganizePage(idx)}
+                            title="Duplicate Page"
+                            style={{ padding: '3px', border: 'none', background: 'transparent', cursor: 'pointer' }}
+                          >
+                            <Copy size={13} />
+                          </button>
+                          <button
+                            type="button"
+                            className="icon-btn"
+                            onClick={() => deleteOrganizePage(idx)}
+                            title="Delete Page"
+                            style={{ padding: '3px', border: 'none', background: 'transparent', cursor: 'pointer' }}
+                          >
+                            <Trash2 size={13} style={{ color: 'var(--brand-red)' }} />
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    style={{ padding: '5px 12px', fontSize: '0.78rem' }}
+                    onClick={() => { setFiles([]); setOrganizePages([]); setDownloadReady(null); }}
+                  >
+                    Select Different Document
+                  </button>
+                  <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                    {organizePages.length} pages will be compiled in this exact sequence.
+                  </span>
+                </div>
+              </div>
             ) : (
               // Default Dropzone
               <>
@@ -685,26 +1543,73 @@ export default function ToolStudio({ tool, onClose, onSaveRecent }) {
                 {/* Uploaded File List */}
                 {files.length > 0 && (
                   <div className="file-list">
-                    {files.map((file, idx) => (
-                      <div key={idx} className="file-item">
-                        <div className="file-item-left">
-                          <FileText size={18} style={{ color: 'var(--brand-red)' }} />
-                          <div>
-                            <strong>{file.name}</strong>
-                            <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginLeft: '8px' }}>
-                              {(file.size / 1024).toFixed(1)} KB
-                            </span>
+                    {files.map((file, idx) => {
+                      const isImage = file.type?.startsWith('image/');
+                      const thumbUrl = isImage ? URL.createObjectURL(file) : null;
+
+                      return (
+                        <div key={idx} className="file-item">
+                          <div className="file-item-left" style={{ alignItems: 'center' }}>
+                            {isImage ? (
+                              <img
+                                src={thumbUrl}
+                                alt="Uploaded preview"
+                                style={{ width: '36px', height: '36px', borderRadius: '6px', objectFit: 'cover', border: '1px solid var(--border-subtle)' }}
+                              />
+                            ) : (
+                              <FileText size={18} style={{ color: 'var(--brand-red)' }} />
+                            )}
+                            <div>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                <strong>{file.name}</strong>
+                                {isImage && (
+                                  <span style={{ fontSize: '0.68rem', background: 'rgba(16, 185, 129, 0.15)', color: 'var(--accent-green)', padding: '1px 6px', borderRadius: '4px', fontWeight: 600 }}>
+                                    Image
+                                  </span>
+                                )}
+                              </div>
+                              <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                                {(file.size / 1024).toFixed(1)} KB
+                              </span>
+                            </div>
+                          </div>
+
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                            {tool.actionType === 'merge' && files.length > 1 && (
+                              <div style={{ display: 'flex', gap: '2px', marginRight: '6px' }}>
+                                <button
+                                  type="button"
+                                  className="icon-btn"
+                                  disabled={idx === 0}
+                                  onClick={() => moveFile(idx, -1)}
+                                  title="Move Up"
+                                  style={{ border: 'none', background: 'transparent', opacity: idx === 0 ? 0.3 : 1, padding: '4px', cursor: idx === 0 ? 'default' : 'pointer' }}
+                                >
+                                  <ArrowUp size={14} />
+                                </button>
+                                <button
+                                  type="button"
+                                  className="icon-btn"
+                                  disabled={idx === files.length - 1}
+                                  onClick={() => moveFile(idx, 1)}
+                                  title="Move Down"
+                                  style={{ border: 'none', background: 'transparent', opacity: idx === files.length - 1 ? 0.3 : 1, padding: '4px', cursor: idx === files.length - 1 ? 'default' : 'pointer' }}
+                                >
+                                  <ArrowDown size={14} />
+                                </button>
+                              </div>
+                            )}
+                            <button
+                              className="icon-btn"
+                              onClick={() => removeFile(idx)}
+                              style={{ border: 'none', background: 'transparent' }}
+                            >
+                              <Trash2 size={15} style={{ color: 'var(--text-muted)' }} />
+                            </button>
                           </div>
                         </div>
-                        <button
-                          className="icon-btn"
-                          onClick={() => removeFile(idx)}
-                          style={{ border: 'none', background: 'transparent' }}
-                        >
-                          <Trash2 size={15} style={{ color: 'var(--text-muted)' }} />
-                        </button>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
               </>
@@ -763,6 +1668,69 @@ export default function ToolStudio({ tool, onClose, onSaveRecent }) {
                 </>
               )}
 
+              {/* Compress options */}
+              {tool.actionType === 'compress' && (
+                <div className="control-group">
+                  <label>Compression Level</label>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                    {[
+                      { id: 'recommended', title: 'Recommended Compression', desc: 'Good quality, high file reduction' },
+                      { id: 'extreme', title: 'Extreme Compression', desc: 'Less quality, smallest file size' },
+                      { id: 'less', title: 'Less Compression', desc: 'High quality, minimal compression' }
+                    ].map((lvl) => (
+                      <button
+                        key={lvl.id}
+                        type="button"
+                        onClick={() => setCompressLevel(lvl.id)}
+                        style={{
+                          padding: '10px 12px',
+                          borderRadius: 'var(--radius-md)',
+                          border: compressLevel === lvl.id ? '1.5px solid var(--brand-red)' : '1px solid var(--border-subtle)',
+                          background: compressLevel === lvl.id ? 'rgba(239, 68, 68, 0.1)' : 'var(--bg-input)',
+                          textAlign: 'left',
+                          cursor: 'pointer'
+                        }}
+                      >
+                        <div style={{ fontWeight: 700, fontSize: '0.82rem', color: compressLevel === lvl.id ? 'var(--brand-red)' : 'var(--text-primary)' }}>
+                          {lvl.title}
+                        </div>
+                        <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '2px' }}>
+                          {lvl.desc}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Merge ordering hint */}
+              {tool.actionType === 'merge' && (
+                <div className="control-group">
+                  <label>Merge Sequence</label>
+                  <div style={{ fontSize: '0.78rem', color: 'var(--text-secondary)', lineHeight: 1.5, background: 'var(--bg-input)', padding: '10px 12px', borderRadius: 'var(--radius-md)', border: '1px solid var(--border-subtle)' }}>
+                    Use the <strong>▲ Up</strong> and <strong>▼ Down</strong> buttons on the left file list to arrange the exact merge order of your documents.
+                  </div>
+                </div>
+              )}
+
+              {/* Alternate & Mix options */}
+              {tool.actionType === 'alternate-mix' && (
+                <div className="control-group">
+                  <label>Duplex Interleave Settings</label>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '0.8rem', padding: '10px 12px', background: 'var(--bg-input)', borderRadius: 'var(--radius-md)', border: '1px solid var(--border-subtle)' }}>
+                    <input
+                      type="checkbox"
+                      checked={mixReverseSecond}
+                      onChange={(e) => setMixReverseSecond(e.target.checked)}
+                    />
+                    <span>Reverse 2nd document (for reverse-scanned back sides)</span>
+                  </label>
+                  <small style={{ color: 'var(--text-muted)', fontSize: '0.7rem', marginTop: '6px', display: 'block' }}>
+                    Alternates Page 1 from Doc A, Page 1 from Doc B, Page 2 from Doc A, etc.
+                  </small>
+                </div>
+              )}
+
               {/* Split options */}
               {tool.actionType === 'split' && (
                 <>
@@ -771,6 +1739,8 @@ export default function ToolStudio({ tool, onClose, onSaveRecent }) {
                     <select className="control-input" value={splitMode} onChange={(e) => setSplitMode(e.target.value)}>
                       <option value="all">Extract all pages to individual files (.zip)</option>
                       <option value="range">Extract custom page ranges (e.g. 1-3, 5)</option>
+                      <option value="even">Extract Even pages only (2, 4, 6...)</option>
+                      <option value="odd">Extract Odd pages only (1, 3, 5...)</option>
                     </select>
                   </div>
                   {splitMode === 'range' && (
@@ -788,15 +1758,334 @@ export default function ToolStudio({ tool, onClose, onSaveRecent }) {
                 </>
               )}
 
+              {/* Split Half options */}
+              {tool.actionType === 'split-half' && (
+                <div className="control-group">
+                  <label>Split Method</label>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                    {[
+                      { id: 'pages', label: 'Document Halves', desc: 'Divide page count into Part 1 (first half) and Part 2 (second half)' },
+                      { id: 'spread', label: '2-Page Book Spread Cut', desc: 'Cut wide 2-page spreads vertically down middle into single pages' }
+                    ].map((item) => (
+                      <button
+                        key={item.id}
+                        type="button"
+                        onClick={() => setSplitHalfMethod(item.id)}
+                        style={{
+                          padding: '10px 12px',
+                          borderRadius: 'var(--radius-md)',
+                          border: splitHalfMethod === item.id ? '1.5px solid var(--brand-red)' : '1px solid var(--border-subtle)',
+                          background: splitHalfMethod === item.id ? 'rgba(239, 68, 68, 0.1)' : 'var(--bg-input)',
+                          textAlign: 'left',
+                          cursor: 'pointer'
+                        }}
+                      >
+                        <div style={{ fontWeight: 700, fontSize: '0.82rem', color: splitHalfMethod === item.id ? 'var(--brand-red)' : 'var(--text-primary)' }}>
+                          {item.label}
+                        </div>
+                        <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '2px' }}>
+                          {item.desc}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Split Text options */}
+              {tool.actionType === 'split-text' && (
+                <>
+                  <div className="control-group">
+                    <label>Split Keyword / Section Title</label>
+                    <input
+                      type="text"
+                      className="control-input"
+                      placeholder="e.g. Chapter, Invoice, Statement"
+                      value={splitTextKeyword}
+                      onChange={(e) => setSplitTextKeyword(e.target.value)}
+                    />
+                    <small style={{ color: 'var(--text-muted)', fontSize: '0.7rem' }}>
+                      Starts a new output PDF document whenever this keyword or section begins.
+                    </small>
+                  </div>
+                  <div className="control-group">
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '0.8rem' }}>
+                      <input
+                        type="checkbox"
+                        checked={splitTextCase}
+                        onChange={(e) => setSplitTextCase(e.target.checked)}
+                      />
+                      <span>Case Sensitive Match</span>
+                    </label>
+                  </div>
+                </>
+              )}
+
+              {/* Split Size options */}
+              {tool.actionType === 'split-size' && (
+                <div className="control-group">
+                  <label>Target File Size Limit per Chunk</label>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                    {[
+                      { mb: 5, label: '5 MB', desc: 'Compact' },
+                      { mb: 10, label: '10 MB', desc: 'Standard' },
+                      { mb: 25, label: '25 MB', desc: 'Email Attachment' },
+                      { mb: 50, label: '50 MB', desc: 'Heavy Files' }
+                    ].map((item) => (
+                      <button
+                        key={item.mb}
+                        type="button"
+                        onClick={() => setSplitTargetMB(item.mb)}
+                        style={{
+                          padding: '8px 10px',
+                          borderRadius: 'var(--radius-md)',
+                          border: splitTargetMB === item.mb ? '1.5px solid var(--brand-red)' : '1px solid var(--border-subtle)',
+                          background: splitTargetMB === item.mb ? 'rgba(239, 68, 68, 0.1)' : 'var(--bg-input)',
+                          textAlign: 'left',
+                          cursor: 'pointer'
+                        }}
+                      >
+                        <div style={{ fontWeight: 700, fontSize: '0.82rem', color: splitTargetMB === item.mb ? 'var(--brand-red)' : 'var(--text-primary)' }}>
+                          {item.label}
+                        </div>
+                        <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>{item.desc}</div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Split Bookmarks options */}
+              {tool.actionType === 'split-bookmarks' && (
+                <div className="control-group">
+                  <label>Chapter Interval (Pages per Part)</label>
+                  <select
+                    className="control-input"
+                    value={splitBookmarkInterval}
+                    onChange={(e) => setSplitBookmarkInterval(parseInt(e.target.value, 10))}
+                  >
+                    <option value={2}>Every 2 Pages (Short Articles)</option>
+                    <option value={5}>Every 5 Pages (Standard Chapters)</option>
+                    <option value={10}>Every 10 Pages (Long Sections)</option>
+                    <option value={20}>Every 20 Pages (Volume Booklets)</option>
+                  </select>
+                  <small style={{ color: 'var(--text-muted)', fontSize: '0.7rem' }}>
+                    Divides document outline and chapters into discrete PDF files (.zip).
+                  </small>
+                </div>
+              )}
+
+              {/* Organize Pages options */}
+              {tool.actionType === 'organize' && (
+                <div className="control-group">
+                  <label>Visual Page Controls</label>
+                  <div style={{ fontSize: '0.78rem', color: 'var(--text-secondary)', background: 'var(--bg-input)', padding: '10px 12px', borderRadius: 'var(--radius-md)', border: '1px solid var(--border-subtle)', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                    <div>Document contains <strong>{organizePages.length}</strong> page(s).</div>
+                    <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                      <button
+                        type="button"
+                        className="btn-secondary"
+                        style={{ padding: '4px 8px', fontSize: '0.72rem' }}
+                        onClick={() => rotateAllOrganizePages(90)}
+                      >
+                        <RotateCw size={12} /> Rotate All +90°
+                      </button>
+                      <button
+                        type="button"
+                        className="btn-secondary"
+                        style={{ padding: '4px 8px', fontSize: '0.72rem' }}
+                        onClick={reverseOrganizePages}
+                      >
+                        <Shuffle size={12} /> Reverse Order
+                      </button>
+                      <button
+                        type="button"
+                        className="btn-secondary"
+                        style={{ padding: '4px 8px', fontSize: '0.72rem' }}
+                        onClick={resetOrganizePages}
+                      >
+                        <RefreshCw size={12} /> Reset Pages
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
               {/* Rotate options */}
               {tool.actionType === 'rotate' && (
+                <>
+                  <div className="control-group">
+                    <label>Rotation Angle</label>
+                    <select className="control-input" value={rotateAngle} onChange={(e) => setRotateAngle(parseInt(e.target.value, 10))}>
+                      <option value={90}>90° Clockwise</option>
+                      <option value={180}>180° Invert</option>
+                      <option value={270}>270° Counter-Clockwise</option>
+                    </select>
+                  </div>
+                  <div className="control-group">
+                    <label>Apply To</label>
+                    <select className="control-input" value={rotateFilter} onChange={(e) => setRotateFilter(e.target.value)}>
+                      <option value="all">All Pages</option>
+                      <option value="odd">Odd Pages Only (1, 3, 5...)</option>
+                      <option value="even">Even Pages Only (2, 4, 6...)</option>
+                    </select>
+                  </div>
+                </>
+              )}
+
+              {/* Flip options */}
+              {tool.actionType === 'flip' && (
                 <div className="control-group">
-                  <label>Rotation Angle</label>
-                  <select className="control-input" value={rotateAngle} onChange={(e) => setRotateAngle(parseInt(e.target.value, 10))}>
-                    <option value={90}>90° Clockwise</option>
-                    <option value={180}>180° Invert</option>
-                    <option value={270}>270° Counter-Clockwise</option>
-                  </select>
+                  <label>Flip Orientation</label>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                    {[
+                      { id: 'both', label: '180° Complete Invert' },
+                      { id: 'horizontal', label: 'Horizontal Mirror' },
+                      { id: 'vertical', label: 'Vertical Upside Down' }
+                    ].map((item) => (
+                      <button
+                        key={item.id}
+                        type="button"
+                        onClick={() => setFlipDirection(item.id)}
+                        style={{
+                          padding: '8px 10px',
+                          borderRadius: 'var(--radius-md)',
+                          border: flipDirection === item.id ? '1.5px solid var(--brand-red)' : '1px solid var(--border-subtle)',
+                          background: flipDirection === item.id ? 'rgba(239, 68, 68, 0.1)' : 'var(--bg-input)',
+                          color: flipDirection === item.id ? 'var(--brand-red)' : 'var(--text-primary)',
+                          fontWeight: flipDirection === item.id ? 700 : 500,
+                          fontSize: '0.78rem',
+                          textAlign: 'left',
+                          cursor: 'pointer'
+                        }}
+                      >
+                        {item.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* N-Up options */}
+              {tool.actionType === 'n-up' && (
+                <>
+                  <div className="control-group">
+                    <label>Pages per Sheet</label>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px' }}>
+                      {[
+                        { count: 2, label: '2-Up (2 pages)' },
+                        { count: 4, label: '4-Up (4 pages 2×2)' }
+                      ].map((item) => (
+                        <button
+                          key={item.count}
+                          type="button"
+                          onClick={() => setNUpCount(item.count)}
+                          style={{
+                            padding: '8px 10px',
+                            borderRadius: 'var(--radius-md)',
+                            border: nUpCount === item.count ? '1.5px solid var(--brand-red)' : '1px solid var(--border-subtle)',
+                            background: nUpCount === item.count ? 'rgba(239, 68, 68, 0.1)' : 'var(--bg-input)',
+                            color: nUpCount === item.count ? 'var(--brand-red)' : 'var(--text-primary)',
+                            fontWeight: nUpCount === item.count ? 700 : 500,
+                            fontSize: '0.78rem',
+                            cursor: 'pointer'
+                          }}
+                        >
+                          {item.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="control-group">
+                    <label>Sheet Orientation</label>
+                    <select
+                      className="control-input"
+                      value={nUpOrientation}
+                      onChange={(e) => setNUpOrientation(e.target.value)}
+                    >
+                      <option value="landscape">Landscape (Handouts)</option>
+                      <option value="portrait">Portrait (Document)</option>
+                    </select>
+                  </div>
+                  <div className="control-group">
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '0.8rem' }}>
+                      <input
+                        type="checkbox"
+                        checked={nUpBorder}
+                        onChange={(e) => setNUpBorder(e.target.checked)}
+                      />
+                      <span>Draw border around each page</span>
+                    </label>
+                  </div>
+                </>
+              )}
+
+              {/* Crop & Resize options */}
+              {tool.actionType === 'crop-resize' && (
+                <>
+                  <div className="control-group">
+                    <label>Standard Dimension / Paper Size</label>
+                    <select
+                      className="control-input"
+                      value={cropPreset}
+                      onChange={(e) => setCropPreset(e.target.value)}
+                    >
+                      <option value="margin">Custom Margin Trim</option>
+                      <option value="a4">Fit to A4 Standard (210 × 297 mm)</option>
+                      <option value="letter">Fit to US Letter (8.5 × 11 in)</option>
+                      <option value="legal">Fit to US Legal (8.5 × 14 in)</option>
+                    </select>
+                  </div>
+                  {cropPreset === 'margin' && (
+                    <div className="control-group">
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <label>Trim Margin</label>
+                        <span style={{ fontSize: '0.78rem', fontWeight: 600 }}>{cropMargin} pt</span>
+                      </div>
+                      <input
+                        type="range"
+                        min="5"
+                        max="50"
+                        value={cropMargin}
+                        onChange={(e) => setCropMargin(parseInt(e.target.value, 10))}
+                      />
+                      <small style={{ color: 'var(--text-muted)', fontSize: '0.7rem' }}>
+                        Trims white margins equally from all 4 borders.
+                      </small>
+                    </div>
+                  )}
+                </>
+              )}
+
+              {/* PDF to ZIP options */}
+              {tool.actionType === 'pdf-to-zip' && (
+                <div className="control-group">
+                  <label>Archive Mode</label>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                    {[
+                      { id: 'bundle', label: 'Bundle selected documents into .zip' },
+                      { id: 'extract-pages', label: 'Extract all pages into separate PDFs in .zip' }
+                    ].map((item) => (
+                      <button
+                        key={item.id}
+                        type="button"
+                        onClick={() => setZipMode(item.id)}
+                        style={{
+                          padding: '8px 10px',
+                          borderRadius: 'var(--radius-md)',
+                          border: zipMode === item.id ? '1.5px solid var(--brand-red)' : '1px solid var(--border-subtle)',
+                          background: zipMode === item.id ? 'rgba(239, 68, 68, 0.1)' : 'var(--bg-input)',
+                          color: zipMode === item.id ? 'var(--brand-red)' : 'var(--text-primary)',
+                          fontWeight: zipMode === item.id ? 700 : 500,
+                          fontSize: '0.78rem',
+                          textAlign: 'left',
+                          cursor: 'pointer'
+                        }}
+                      >
+                        {item.label}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               )}
 
@@ -871,17 +2160,179 @@ export default function ToolStudio({ tool, onClose, onSaveRecent }) {
                 </div>
               )}
 
-              {/* Background removal tolerance */}
+              {/* Background removal options */}
               {tool.actionType === 'bg-remove' && (
-                <div className="control-group">
-                  <label>Edge Color Tolerance ({bgTolerance})</label>
-                  <input
-                    type="range"
-                    min="10"
-                    max="80"
-                    value={bgTolerance}
-                    onChange={(e) => setBgTolerance(parseInt(e.target.value, 10))}
-                  />
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+                  <div className="control-group">
+                    <label>Replacement Backdrop</label>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px' }}>
+                      {[
+                        { id: 'transparent', label: '🏁 Transparent' },
+                        { id: '#ffffff', label: '⬜ White (Shop)' },
+                        { id: '#0f172a', label: '⬛ Obsidian Dark' },
+                        { id: '#2563eb', label: '🟦 Passport Blue' },
+                      ].map((item) => (
+                        <button
+                          key={item.id}
+                          type="button"
+                          onClick={() => setBgReplacement(item.id)}
+                          style={{
+                            padding: '6px 8px',
+                            borderRadius: '6px',
+                            border: bgReplacement === item.id ? '1.5px solid var(--brand-red)' : '1px solid var(--border-subtle)',
+                            background: bgReplacement === item.id ? 'rgba(239, 68, 68, 0.1)' : 'var(--bg-input)',
+                            color: bgReplacement === item.id ? 'var(--brand-red)' : 'var(--text-primary)',
+                            fontWeight: bgReplacement === item.id ? 700 : 500,
+                            cursor: 'pointer',
+                            fontSize: '0.74rem',
+                            textAlign: 'left'
+                          }}
+                        >
+                          {item.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="control-group">
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <label>Color Sensitivity & Tolerance</label>
+                      <span style={{ fontSize: '0.78rem', fontWeight: 600, color: 'var(--brand-red)' }}>{bgTolerance}</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="15"
+                      max="75"
+                      value={bgTolerance}
+                      onChange={(e) => setBgTolerance(parseInt(e.target.value, 10))}
+                    />
+                    <small style={{ color: 'var(--text-muted)', fontSize: '0.7rem' }}>Adjust to remove complex backgrounds without cutting into subject.</small>
+                  </div>
+
+                  <div className="control-group">
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <label>Edge Feathering & Smoothing</label>
+                      <span style={{ fontSize: '0.78rem', fontWeight: 600 }}>{bgEdgeSmooth} px</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max="5"
+                      value={bgEdgeSmooth}
+                      onChange={(e) => setBgEdgeSmooth(parseInt(e.target.value, 10))}
+                    />
+                    <small style={{ color: 'var(--text-muted)', fontSize: '0.7rem' }}>Smooths boundary alpha to prevent jagged borders.</small>
+                  </div>
+                </div>
+              )}
+
+              {/* HD Image Upscaler Options */}
+              {tool.actionType === 'upscale-image' && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+
+                  <div className="control-group">
+                    <label>HD Scale Factor</label>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '6px' }}>
+                      {[
+                        { factor: 2, label: '2x HD', sub: 'Balanced' },
+                        { factor: 3, label: '3x Full HD', sub: 'High Res' },
+                        { factor: 4, label: '4x Ultra HD', sub: '4K Clarity' }
+                      ].map((item) => (
+                        <button
+                          key={item.factor}
+                          type="button"
+                          onClick={() => setUpscaleFactor(item.factor)}
+                          style={{
+                            padding: '8px 4px',
+                            display: 'flex',
+                            flexDirection: 'column',
+                            alignItems: 'center',
+                            gap: '2px',
+                            borderRadius: 'var(--radius-md)',
+                            border: upscaleFactor === item.factor ? '1.5px solid var(--brand-red)' : '1px solid var(--border-subtle)',
+                            background: upscaleFactor === item.factor ? 'rgba(239, 68, 68, 0.1)' : 'var(--bg-input)',
+                            color: upscaleFactor === item.factor ? 'var(--brand-red)' : 'var(--text-primary)',
+                            fontWeight: upscaleFactor === item.factor ? 700 : 500,
+                            cursor: 'pointer',
+                            fontSize: '0.8rem'
+                          }}
+                        >
+                          <span>{item.label}</span>
+                          <span style={{ fontSize: '0.68rem', opacity: 0.75 }}>{item.sub}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="control-group">
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <label>AI Detail Sharpening</label>
+                      <span style={{ fontSize: '0.78rem', fontWeight: 600, color: 'var(--brand-red)' }}>{upscaleSharpen}%</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max="100"
+                      value={upscaleSharpen}
+                      onChange={(e) => setUpscaleSharpen(parseInt(e.target.value, 10))}
+                    />
+                    <small style={{ color: 'var(--text-muted)', fontSize: '0.7rem' }}>Crispen edges & textures without noise artifacts.</small>
+                  </div>
+
+                  <div className="control-group">
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <label>Artifact Denoise</label>
+                      <span style={{ fontSize: '0.78rem', fontWeight: 600 }}>{upscaleDenoise}%</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max="100"
+                      value={upscaleDenoise}
+                      onChange={(e) => setUpscaleDenoise(parseInt(e.target.value, 10))}
+                    />
+                  </div>
+
+                  <div className="control-group">
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <label>Tone & Clarity Boost</label>
+                      <span style={{ fontSize: '0.78rem', fontWeight: 600 }}>{upscaleContrast}%</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max="40"
+                      value={upscaleContrast}
+                      onChange={(e) => setUpscaleContrast(parseInt(e.target.value, 10))}
+                    />
+                  </div>
+
+                  <div className="control-group">
+                    <label>Export Format</label>
+                    <select
+                      className="control-input"
+                      value={upscaleFormat}
+                      onChange={(e) => setUpscaleFormat(e.target.value)}
+                    >
+                      <option value="image/png">PNG (Maximum Lossless Quality)</option>
+                      <option value="image/jpeg">JPEG (High Quality Compressed)</option>
+                      <option value="image/webp">WebP (Modern Web Format)</option>
+                    </select>
+                  </div>
+
+                  {upscalePreviewInfo && (
+                    <div style={{ padding: '10px 12px', background: 'rgba(16, 185, 129, 0.1)', border: '1px solid rgba(16, 185, 129, 0.25)', borderRadius: 'var(--radius-md)', fontSize: '0.78rem', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                      <div style={{ color: 'var(--accent-green)', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        <Check size={14} /> HD Upgrade Ready ({upscalePreviewInfo.scaleFactor}x Upscaled)
+                      </div>
+                      <div style={{ color: 'var(--text-secondary)' }}>
+                        Original: {upscalePreviewInfo.origWidth} × {upscalePreviewInfo.origHeight} px
+                      </div>
+                      <div style={{ color: 'var(--text-primary)', fontWeight: 600 }}>
+                        Output HD: {upscalePreviewInfo.targetWidth} × {upscalePreviewInfo.targetHeight} px
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
 

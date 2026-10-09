@@ -10,11 +10,23 @@ export const TOOL_CATEGORIES = [
   { id: 'ai', name: 'AI & analysis', count: 5, icon: 'Sparkles' },
   { id: 'business', name: 'Business & billing', count: 3, icon: 'Receipt' },
   { id: 'share', name: 'Share & workflows', count: 4, icon: 'Share2' },
-  { id: 'images', name: 'Images', count: 2, icon: 'ImageMinus' },
+  { id: 'images', name: 'Images', count: 3, icon: 'ImageMinus' },
 ];
 
 export const ALL_TOOLS = [
   // --- Popular & Page Management ---
+  {
+    id: 'upscale-image',
+    title: 'HD image upscaler',
+    description: 'Upgrade images to high definition (2x, 3x, 4x HD) with AI detail sharpening and noise reduction.',
+    category: 'images',
+    popular: true,
+    badge: 'HD Quality',
+    icon: 'Sparkles',
+    actionType: 'upscale-image',
+    accept: 'image/*',
+    tags: ['hd', 'upscale', 'high definition', 'enhance photo', '4k', 'sharpen', 'super resolution', 'resolution']
+  },
   {
     id: 'compress-pdf',
     title: 'Compress PDF',
